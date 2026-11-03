@@ -62,6 +62,11 @@ class UvccameraLibPreviewBackend(
     private var xformFitX = 1f
     private var xformFitY = 1f
 
+    /** Latest LUT from the UI; re-uploaded whenever a camera starts. */
+    private var lutSize = 0
+    private var lutRgba: IntArray? = null
+    private var lutStrength = 0f
+
     private var usbMonitorRef: USBMonitor? = null
 
     private var targetWidth = -1
@@ -386,6 +391,29 @@ class UvccameraLibPreviewBackend(
         uvcCamera?.setPreviewTransform(
             rotationDegrees, flipHorizontal, flipVertical, scale, panXNdc, panYNdc, fitScaleX, fitScaleY,
         )
+    }
+
+    override fun setPreviewLut(size: Int, rgba: IntArray, strength: Float): Boolean {
+        if (size <= 0 || rgba.size != size * size * size) return false
+        lutSize = size
+        lutRgba = rgba
+        lutStrength = strength.coerceIn(0f, 1f)
+        val camera = uvcCamera ?: return true
+        return applyPreviewLut(camera)
+    }
+
+    /** Uploads the stored LUT; a missing native symbol or renderer failure must not stop preview. */
+    private fun applyPreviewLut(camera: UVCCamera): Boolean {
+        val rgba = lutRgba ?: return false
+        if (lutSize <= 0) return false
+        return try {
+            val result = camera.setPreviewLut(lutSize, rgba, lutStrength)
+            if (result != 0) Log.w(logTag, "playback: setPreviewLut returned $result")
+            result == 0
+        } catch (failure: Throwable) {
+            Log.w(logTag, "playback: setPreviewLut failed", failure)
+            false
+        }
     }
 
     /** The target currently bound to a view, or null. */
@@ -1081,6 +1109,8 @@ class UvccameraLibPreviewBackend(
             Log.i(logTag, "playback: startPreview native ${SystemClock.elapsedRealtime() - t1}ms")
 
             uvcCamera = camera
+            /* The native renderer is rebuilt per start, so replay the LUT stored by setPreviewLut. */
+            if (lutRgba != null) applyPreviewLut(camera)
 
             deferredAudioRunnable?.let { mainHandler.removeCallbacks(it) }
             deferredAudioFallbackRunnable?.let { mainHandler.removeCallbacks(it) }

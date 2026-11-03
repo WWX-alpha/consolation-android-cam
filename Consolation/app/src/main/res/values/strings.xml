@@ -63,6 +63,14 @@
     <string name="settings_stats_off">Off</string>
     <string name="settings_stats_bottom_left">Bottom Left</string>
     <string name="settings_stats_bottom_right">Bottom Right</string>
+    <string name="settings_section_lut">Color LUT</string>
+    <string name="settings_lut_strength">Strength</string>
+    <string name="settings_lut_strength_value">%1$d%%</string>
+    <string name="lut_none">None</string>
+    <string name="action_import_lut">Import .cube</string>
+    <string name="message_lut_imported">Imported LUT: %1$s</string>
+    <string name="message_lut_load_failed">Could not load the selected LUT.</string>
+    <string name="message_lut_h264_unsupported">H264 format does not support LUT.</string>
     <string name="help_title">Consolation Help</string>
     <string name="help_getting_started_title">Getting Started</string>
     <string name="help_getting_started_body">Connect a USB capture device, select it from the list, and press Play.</string>

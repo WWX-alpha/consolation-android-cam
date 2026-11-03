@@ -76,6 +76,13 @@ interface UsbVideoPreviewBackend : PreviewRenderer {
         fitScaleY: Float,
     ) = Unit
 
+    /**
+     * 3D colour LUT for the native renderer: [rgba] holds [size]³ 0xAARRGGBB entries in .cube
+     * row order (red varies fastest), blended by [strength] 0f-1f (0 = no change).
+     * Returns false when the backend cannot apply it; callers must never surface a failure.
+     */
+    fun setPreviewLut(size: Int, rgba: IntArray, strength: Float): Boolean = false
+
     fun dispose()
 
     /**

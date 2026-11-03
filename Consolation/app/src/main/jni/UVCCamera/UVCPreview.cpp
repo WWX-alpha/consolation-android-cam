@@ -1127,6 +1127,13 @@ int UVCPreview::setPreviewTransform(int rotation_degrees, bool flip_h, bool flip
 	return 0;
 }
 
+int UVCPreview::setPreviewLut(const uint8_t *rgba, int size, float strength) {
+	if (!mGpuPreviewRenderer)
+		return EXIT_FAILURE;
+	mGpuPreviewRenderer->setLut(rgba, size, strength);
+	return 0;
+}
+
 int UVCPreview::setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format) {
 	
 	ENTER();

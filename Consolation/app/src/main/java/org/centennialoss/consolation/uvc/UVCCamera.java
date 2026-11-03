@@ -497,6 +497,25 @@ public class UVCCamera {
 		}
 	}
 
+	/**
+	 * 3D LUT (colour grading) for the preview: size^3 RGBA texels, red varying
+	 * fastest, one texel per int packed as {@code r | (g << 8) | (b << 16) |
+	 * (a << 24)} (alpha is ignored).  size 0 disables the LUT.
+	 *
+	 * @return 0 on success, -1 if the native object is gone or the arguments are
+	 *         invalid (size outside 2..64, or a table shorter than size^3).
+	 */
+	public synchronized int setPreviewLut(final int size, final int[] rgba, final float strength) {
+		if (mNativePtr == 0) {
+			return -1;
+		}
+		if (size != 0 && (size < 2 || size > 64 || rgba == null
+				|| rgba.length < size * size * size)) {
+			return -1;
+		}
+		return nativeSetPreviewLut(mNativePtr, size, rgba, strength);
+	}
+
     /**
      * set frame callback
      * @param callback
@@ -1170,6 +1189,8 @@ public class UVCCamera {
 	private static final native int nativeSetPreviewTransform(final long id_camera, final int rotation,
 		final boolean flipH, final boolean flipV, final float scale, final float panX, final float panY,
 		final float fitX, final float fitY);
+	private static final native int nativeSetPreviewLut(final long id_camera, final int size,
+		final int[] rgba, final float strength);
     private static final native int nativeSetPreviewFrameCallback(final long mNativePtr, final IFrameCallback callback, final int pixelFormat);
     private static final native int nativeSetFrameCallback(final long mNativePtr, final IFrameCallback callback, final int pixelFormat);
 	private static final native long[] nativeGetAndResetProcessingStats(final long mNativePtr);

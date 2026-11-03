@@ -110,6 +110,9 @@ import org.centennialoss.consolation.capture.DeviceCompatibilityIssues
 import org.centennialoss.consolation.capture.NoopCaptureEngine
 import org.centennialoss.consolation.core.capture.CaptureDevice
 import org.centennialoss.consolation.core.capture.CaptureState
+import org.centennialoss.consolation.lut.CubeLut
+import org.centennialoss.consolation.lut.LutRepository
+import org.centennialoss.consolation.lut.LutSelection
 import org.centennialoss.consolation.preview.backend.UsbVideoPreviewBackend
 import org.centennialoss.consolation.preview.backend.UsbVideoPreviewBackendFactory
 import org.centennialoss.consolation.usb.UsbCaptureDeviceRepository
@@ -197,6 +200,14 @@ class MainActivity : ComponentActivity() {
     private var audioMuted by mutableStateOf(false)
     private var volumeBeforeMute = 100
 
+    private lateinit var lutRepository: LutRepository
+    private var lutSelection: LutSelection by mutableStateOf(LutSelection.None)
+    private var lutStrengthPercent by mutableIntStateOf(100)
+    private var lutEntries: List<LutRepository.Entry> by mutableStateOf(emptyList())
+    private var appliedLutSelection: LutSelection = LutSelection.None
+    private var appliedLut: CubeLut? = null
+    private var lutLoadJob: Job? = null
+
     private var lowFpsBelowThresholdSinceMs: Long = 0L
     private var lastTelemetryLogAtMs: Long = 0L
 
@@ -235,6 +246,10 @@ class MainActivity : ComponentActivity() {
     private var pendingRuntimePermissionAction: RuntimePermissionAction? = null
     private var startWatchAfterUsbPermission = false
 
+    private val importLutDocument = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        if (uri != null) importLutFromUri(uri)
+    }
+
     private val requestCameraRecordForWatch = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions(),
     ) { results ->
@@ -270,6 +285,7 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         prefs = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+        lutRepository = LutRepository(this, prefs)
         loadSettingsFromPrefs()
 
         deviceRepository = UsbCaptureDeviceRepository(this)
@@ -277,6 +293,8 @@ class MainActivity : ComponentActivity() {
         previewBackend.setCaptureAudioFailureListener {
             showCaptureAudioFailureDialog()
         }
+        /* Hands the stored selection to the backend up front, which replays it on every preview start. */
+        ensureLutLoaded(lutSelection)
 
         setContent {
             MaterialTheme(colorScheme = ConsolationColorScheme) {
@@ -1631,6 +1649,9 @@ class MainActivity : ComponentActivity() {
         isOneToOneZoom = prefs.getBoolean(KEY_ZOOM_ONE_TO_ONE, false)
         audioVolumePercent = prefs.getInt(KEY_VOLUME, 100).coerceIn(0, 100)
         audioMuted = prefs.getBoolean(KEY_MUTED, false)
+        lutSelection = LutSelection.decode(prefs.getString(KEY_LUT_SELECTED, null))
+        lutStrengthPercent = prefs.getInt(KEY_LUT_STRENGTH, 100).coerceIn(0, 100)
+        lutEntries = lutRepository.entries()
     }
 
     private fun persistSettings() {
@@ -1647,7 +1668,62 @@ class MainActivity : ComponentActivity() {
             .putBoolean(KEY_ZOOM_ONE_TO_ONE, isOneToOneZoom)
             .putInt(KEY_VOLUME, audioVolumePercent)
             .putBoolean(KEY_MUTED, audioMuted)
+            .putString(KEY_LUT_SELECTED, lutSelection.encode())
+            .putInt(KEY_LUT_STRENGTH, lutStrengthPercent)
             .apply()
+    }
+
+    private fun importLutFromUri(uri: Uri) {
+        runCatching { contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
+            .onFailure { Log.w(LUT_LOG_TAG, "takePersistableUriPermission failed", it) }
+        val imported = lutRepository.importCube(uri)
+        lutEntries = lutRepository.entries()
+        selectLut(LutSelection.Imported(imported.uri))
+        showMessage(getString(R.string.message_lut_imported, imported.displayName))
+    }
+
+    private fun selectLut(selection: LutSelection) {
+        lutSelection = selection
+        persistSettings()
+        if (selection != LutSelection.None && selectedPixelFormatPreference == PixelFormatPreference.H264) {
+            showMessage(getString(R.string.message_lut_h264_unsupported))
+        }
+        ensureLutLoaded(selection)
+    }
+
+    /** Parses [selection] on IO only when it is not already the table in memory. */
+    private fun ensureLutLoaded(selection: LutSelection) {
+        if (selection == LutSelection.None) {
+            refreshAppliedLut()
+            return
+        }
+        if (selection == appliedLutSelection && appliedLut != null) {
+            refreshAppliedLut()
+            return
+        }
+        lutLoadJob?.cancel()
+        lutLoadJob = lifecycleScope.launch {
+            val lut = withContext(Dispatchers.IO) {
+                runCatching { lutRepository.load(selection) }
+                    .onFailure { Log.w(LUT_LOG_TAG, "LUT load failed for $selection", it) }
+                    .getOrNull()
+            }
+            if (lut == null) {
+                showMessage(getString(R.string.message_lut_load_failed))
+                return@launch
+            }
+            if (lutSelection != selection) return@launch
+            appliedLut = lut
+            appliedLutSelection = selection
+            refreshAppliedLut()
+        }
+    }
+
+    /** Re-uploads the in-memory table with the current strength; never re-parses. */
+    private fun refreshAppliedLut() {
+        val lut = appliedLut ?: return
+        val strength = if (lutSelection == LutSelection.None) 0f else lutStrengthPercent / 100f
+        previewBackend.setPreviewLut(lut.size, lut.data, strength)
     }
 
     @Composable
@@ -2517,6 +2593,48 @@ class MainActivity : ComponentActivity() {
                 updatePipParams()
                 persistSettings()
             }
+            SectionTitle(getString(R.string.settings_section_lut))
+            lutEntries.forEach { entry ->
+                RadioSetting(entry.title, entry.selection == lutSelection) {
+                    selectLut(entry.selection)
+                }
+            }
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = getString(R.string.settings_lut_strength),
+                    color = Color.White,
+                    fontSize = 15.sp,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(end = 18.dp),
+                )
+                WhiteSlider(
+                    value = lutStrengthPercent.toFloat(),
+                    onValueChange = {
+                        lutStrengthPercent = it.roundToInt().coerceIn(0, 100)
+                        refreshAppliedLut()
+                    },
+                    onValueChangeFinished = {
+                        persistSettings()
+                        refreshAppliedLut()
+                    },
+                )
+                Text(
+                    text = getString(R.string.settings_lut_strength_value, lutStrengthPercent),
+                    color = Color.White,
+                    fontSize = 15.sp,
+                    modifier = Modifier.padding(start = 14.dp),
+                )
+                Spacer(Modifier.weight(1f))
+                SmallPillButton(getString(R.string.action_import_lut)) {
+                    importLutDocument.launch(arrayOf("*/*"))
+                }
+            }
+            if (selectedPixelFormatPreference == PixelFormatPreference.H264) {
+                BodyText(getString(R.string.message_lut_h264_unsupported), Modifier.padding(top = 6.dp))
+            }
             DividerLine()
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 SmallPillButton(getString(R.string.action_help)) { activeSheet = ActiveSheet.HELP }
@@ -2906,6 +3024,9 @@ class MainActivity : ComponentActivity() {
         private const val ZOOM_PAN_EPSILON = 0.001f
         private const val KEY_VOLUME = "volume"
         private const val KEY_MUTED = "muted"
+        private const val KEY_LUT_SELECTED = "lut_selected"
+        private const val KEY_LUT_STRENGTH = "lut_strength"
+        private const val LUT_LOG_TAG = "ConsolationLut"
         private const val KEY_DEVICE_FORMAT_PREFIX = "device_format:"
         private const val MENU_ID_RESOLUTION_BASE = 10_000
 

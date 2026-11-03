@@ -299,6 +299,13 @@ int UVCCamera::setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_
 	return result;
 }
 
+int UVCCamera::setPreviewLut(const uint8_t *rgba, int size, float strength) {
+	int result = EXIT_FAILURE;
+	if (mPreview)
+		result = mPreview->setPreviewLut(rgba, size, strength);
+	return result;
+}
+
 int UVCCamera::setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format) {
 	ENTER();
 	int result = EXIT_FAILURE;

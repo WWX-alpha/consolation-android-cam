@@ -12,6 +12,11 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <atomic>
+#include <mutex>
+#include <string>
+#include <vector>
+
 namespace {
 
 static uint64_t now_ns()
@@ -31,6 +36,47 @@ static const char *vertex_shader_src =
 	"  vTex = aTex;\n"
 	"  gl_Position = vec4((uXform * vec3(aPos, 1.0)).xy, 0.0, 1.0);\n"
 	"}\n";
+
+/* 3D LUT injection.  The fragment program bodies stay untouched: "main" is
+ * macro-renamed to fragMain, the wrapper below calls it and then grades
+ * fragColor.  The precision statements are needed before applyLut() because a
+ * fragment shader has no default float precision until it says so. */
+static const char lut_prelude[] =
+	"#define main fragMain\n"
+	"precision highp float;\n"
+	"precision highp int;\n"
+	"uniform highp sampler3D uLut;\n"
+	"uniform int uLutSize;\n"
+	"uniform float uLutStrength;\n"
+	"vec3 applyLut(vec3 rgb) {\n"
+	"  return texture(uLut, clamp(rgb, 0.0, 1.0)).rgb;\n"
+	"}\n";
+
+static const char lut_epilogue[] =
+	"#undef main\n"
+	"void main() {\n"
+	"  fragMain();\n"
+	"  if (uLutSize > 0 && uLutStrength > 0.0) {\n"
+	"    fragColor.rgb = mix(fragColor.rgb,\n"
+	"      applyLut(clamp(fragColor.rgb, 0.0, 1.0)), clamp(uLutStrength, 0.0, 1.0));\n"
+	"  }\n"
+	"}\n";
+
+/* Splice the LUT prelude/epilogue around a fragment shader: "#version 300 es"
+ * has to stay the first line of the translation unit. */
+static std::string inject_lut(const char *src)
+{
+	const char *eol = strchr(src, '\n');
+	if (!eol || strncmp(src, "#version", 8) != 0)
+		return std::string(src);	/* unknown source shape: link it as-is */
+	std::string out;
+	out.reserve(strlen(src) + sizeof(lut_prelude) + sizeof(lut_epilogue));
+	out.append(src, (size_t)(eol - src) + 1);
+	out += lut_prelude;
+	out.append(eol + 1);
+	out += lut_epilogue;
+	return out;
+}
 
 static const char *yuyv_fragment_shader_src =
 	"#version 300 es\n"
@@ -332,8 +378,11 @@ static GLuint compile_shader(GLenum type, const char *src)
 
 static GLuint link_program(const char *fragment_src)
 {
+	/* Every fragment program is linked with the LUT wrapper spliced in, so all
+	 * of them grade the same way and none of the bodies carries LUT code. */
+	const std::string lut_src = inject_lut(fragment_src);
 	GLuint vs = compile_shader(GL_VERTEX_SHADER, vertex_shader_src);
-	GLuint fs = compile_shader(GL_FRAGMENT_SHADER, fragment_src);
+	GLuint fs = compile_shader(GL_FRAGMENT_SHADER, lut_src.c_str());
 	if (!vs || !fs) {
 		if (vs) glDeleteShader(vs);
 		if (fs) glDeleteShader(fs);
@@ -373,6 +422,7 @@ struct UVCGpuPreviewRenderer::Impl {
 		GLint chromaWidth = -1, chromaHeight = -1, gray = -1, uyvy = -1;
 		GLint storageWidth = -1, format = -1;
 		GLint xform = -1;
+		GLint lut = -1, lutSize = -1, lutStrength = -1;
 	};
 	/* Identity until UVCPreview pushes rotation/flip/zoom/pan (column-major). */
 	float xform[9] = { 1, 0, 0,  0, 1, 0,  0, 0, 1 };
@@ -385,6 +435,20 @@ struct UVCGpuPreviewRenderer::Impl {
 	GLuint programs[PROGRAM_COUNT] = {};
 	Uniforms uniforms[PROGRAM_COUNT];
 	GLuint textures[3] = {};
+	/* 3D LUT (colour grading).  setLut() only copies and marks dirty; the table
+	 * reaches a 3D texture on the render thread, and the dirty flag is also set
+	 * when the GL context is rebuilt so the table survives surface loss.
+	 * Unit 3: units 0/1/2 carry the frame planes. */
+	static const int LUT_TEXTURE_UNIT = 3;
+	static const int LUT_MAX_SIZE = 64;
+	std::mutex lutMutex;
+	std::vector<uint8_t> lutData;	/**< size^3 RGBA, red fastest; guarded */
+	int lutSize = 0;				/**< 0 = disabled; guarded */
+	float lutStrength = 0.0f;		/**< guarded */
+	std::atomic<bool> lutDirty{false};	/**< set by setLut()/context loss */
+	GLuint lutTextureId = 0;		/**< render thread only */
+	int lutActiveSize = 0;			/**< render thread only */
+	float lutActiveStrength = 0.0f;	/**< render thread only */
 	/* Storage spec currently allocated for each of the 3 texture units, so the
 	 * steady state is one glTexSubImage2D per plane (no re-specification). */
 	int texWidth[3] = {};
@@ -435,6 +499,9 @@ struct UVCGpuPreviewRenderer::Impl {
 	void captureRenderFence();
 	bool uploadAndDraw(uvc_frame_t *frame);
 	void resetTextureStorage();
+	void markLutDirty();
+	void uploadLutIfDirty();
+	void pushLutUniforms();
 	bool uploadTexture(int unit, GLenum internal, GLenum format, GLenum type,
 		GLint filter, int width, int height, int stride_px, const void *data);
 };
@@ -520,6 +587,33 @@ void UVCGpuPreviewRenderer::setTransform(const float m[9])
 {
 	if (impl && m)
 		memcpy(impl->xform, m, sizeof(impl->xform));
+}
+
+void UVCGpuPreviewRenderer::setLut(const uint8_t *rgba, int size, float strength)
+{
+	if (!impl)
+		return;
+	if (size != 0 && (size < 2 || size > Impl::LUT_MAX_SIZE))
+		return;	/* out of range: keep whatever is loaded */
+	if (size != 0 && !rgba)
+		return;
+	std::lock_guard<std::mutex> lock(impl->lutMutex);
+	if (size == 0) {
+		impl->lutSize = 0;
+		impl->lutData.clear();
+		impl->lutStrength = 0.0f;
+	} else {
+		impl->lutData.assign(rgba, rgba + (size_t)size * size * size * 4u);
+		impl->lutSize = size;
+		impl->lutStrength = strength;
+	}
+	impl->lutDirty.store(true, std::memory_order_release);
+}
+
+/* The 3D texture dies with the EGL surface: re-upload it with the next one. */
+void UVCGpuPreviewRenderer::Impl::markLutDirty()
+{
+	lutDirty.store(true, std::memory_order_release);
 }
 
 void UVCGpuPreviewRenderer::invalidateSurfaceSize()
@@ -639,6 +733,13 @@ void UVCGpuPreviewRenderer::Impl::destroySurface()
 		memset(textures, 0, sizeof(textures));
 		resetTextureStorage();
 	}
+	if (lutTextureId) {
+		glDeleteTextures(1, &lutTextureId);
+		lutTextureId = 0;
+	}
+	lutActiveSize = 0;
+	lutActiveStrength = 0.0f;
+	markLutDirty();	/* the table is re-uploaded with the next surface */
 	if (hardwareImage != EGL_NO_IMAGE_KHR) {
 		if (pDestroyImage)
 			pDestroyImage(display, hardwareImage);
@@ -683,6 +784,13 @@ void UVCGpuPreviewRenderer::Impl::destroyGl()
 		}
 		uniforms[i] = Uniforms();
 	}
+	if (lutTextureId) {
+		glDeleteTextures(1, &lutTextureId);
+		lutTextureId = 0;
+	}
+	lutActiveSize = 0;
+	lutActiveStrength = 0.0f;
+	markLutDirty();
 	if (display != EGL_NO_DISPLAY && context != EGL_NO_CONTEXT) {
 		eglDestroyContext(display, context);
 		context = EGL_NO_CONTEXT;
@@ -755,10 +863,16 @@ GLuint UVCGpuPreviewRenderer::Impl::program(ProgramKind kind)
 	u.storageWidth = glGetUniformLocation(prog, "uStorageWidth");
 	u.format = glGetUniformLocation(prog, "uFormat");
 	u.xform = glGetUniformLocation(prog, "uXform");
+	u.lut = glGetUniformLocation(prog, "uLut");
+	u.lutSize = glGetUniformLocation(prog, "uLutSize");
+	u.lutStrength = glGetUniformLocation(prog, "uLutStrength");
 	glUseProgram(prog);
 	glUniform1i(u.tex0, 0);
 	glUniform1i(u.tex1, 1);
 	glUniform1i(u.tex2, 2);
+	glUniform1i(u.lut, LUT_TEXTURE_UNIT);
+	glUniform1i(u.lutSize, lutActiveSize);
+	glUniform1f(u.lutStrength, lutActiveStrength);
 	return prog;
 }
 
@@ -799,8 +913,77 @@ void UVCGpuPreviewRenderer::Impl::refreshSurfaceSize(bool force)
 	surface_height = sh;
 }
 
+/* Push the LUT state to every linked program; the values only change when a
+ * table is uploaded, so the per-frame path stays untouched. */
+void UVCGpuPreviewRenderer::Impl::pushLutUniforms()
+{
+	GLint current = 0;
+	glGetIntegerv(GL_CURRENT_PROGRAM, &current);
+	for (int i = 0; i < PROGRAM_COUNT; ++i) {
+		if (!programs[i])
+			continue;
+		const Uniforms &u = uniforms[i];
+		glUseProgram(programs[i]);
+		glUniform1i(u.lut, LUT_TEXTURE_UNIT);
+		glUniform1i(u.lutSize, lutActiveSize);
+		glUniform1f(u.lutStrength, lutActiveStrength);
+	}
+	glUseProgram((GLuint)current);
+}
+
+/* Upload the pending LUT: a changed table, or a rebuilt context.  In the steady
+ * state this is one atomic load; the 3D texture is only touched when dirty. */
+void UVCGpuPreviewRenderer::Impl::uploadLutIfDirty()
+{
+	if (!lutDirty.load(std::memory_order_acquire))
+		return;
+	std::vector<uint8_t> data;
+	int size = 0;
+	float strength = 0.0f;
+	{
+		std::lock_guard<std::mutex> lock(lutMutex);
+		lutDirty.store(false, std::memory_order_release);
+		data = lutData;
+		size = lutSize;
+		strength = lutStrength;
+	}
+	if (size <= 0 || data.size() < (size_t)size * size * size * 4u) {
+		lutActiveSize = 0;
+		lutActiveStrength = 0.0f;
+		pushLutUniforms();
+		return;
+	}
+	if (!lutTextureId)
+		glGenTextures(1, &lutTextureId);
+	glActiveTexture(GL_TEXTURE0 + LUT_TEXTURE_UNIT);
+	glBindTexture(GL_TEXTURE_3D, lutTextureId);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	glTexParameteri(GL_TEXTURE_3D, GL_TEXTURE_WRAP_R, GL_CLAMP_TO_EDGE);
+	glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+	glTexImage3D(GL_TEXTURE_3D, 0, GL_RGBA8, size, size, size, 0, GL_RGBA,
+		GL_UNSIGNED_BYTE, data.data());
+	glActiveTexture(GL_TEXTURE0);
+	const GLenum err = glGetError();
+	if (err != GL_NO_ERROR) {
+		LOGW("gpu-preview: 3D LUT upload failed size=%d glerr=0x%x", size, err);
+		lutActiveSize = 0;
+		lutActiveStrength = 0.0f;
+		pushLutUniforms();
+		return;
+	}
+	lutActiveSize = size;
+	lutActiveStrength = strength;
+	pushLutUniforms();
+}
+
+/* All three draw paths funnel through here with their program already bound,
+ * after eglMakeCurrent, so this is the one place the LUT texture is uploaded. */
 void UVCGpuPreviewRenderer::Impl::drawQuad(ProgramKind kind)
 {
+	uploadLutIfDirty();
 	refreshSurfaceSize(false);
 	glViewport(0, 0, surface_width, surface_height);
 	/* A zoom scale below 1 (zoomed out / 1:1 on a small stream) leaves part of the

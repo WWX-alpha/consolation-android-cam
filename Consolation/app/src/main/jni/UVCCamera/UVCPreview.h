@@ -281,6 +281,10 @@ public:
 	 * mirrored by the View system, while zooming into the letterbox area. */
 	int setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_v,
 		float scale, float pan_x_ndc, float pan_y_ndc, float fit_x, float fit_y);
+	/** 3D LUT for the GPU preview: size^3 RGBA texels, red varying fastest;
+	 * size 0 clears it.  The renderer copies the table, so this may be called
+	 * from another thread than the preview. */
+	int setPreviewLut(const uint8_t *rgba, int size, float strength);
 	int setPreviewFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int startPreview();

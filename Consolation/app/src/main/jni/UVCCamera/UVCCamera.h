@@ -193,6 +193,8 @@ public:
 	int setPreviewSize(int width, int height, int min_fps, int max_fps, int mode, float bandwidth = DEFAULT_BANDWIDTH);
 	int setPreviewDisplay(ANativeWindow *preview_window);
 	int setPreviewTransform(int rotation_degrees, bool flip_h, bool flip_v, float scale, float pan_x_ndc, float pan_y_ndc, float fit_x, float fit_y);
+	/** 3D LUT for the preview: size^3 RGBA texels, red varying fastest; size 0 clears it. */
+	int setPreviewLut(const uint8_t *rgba, int size, float strength);
 	int setPreviewFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int setFrameCallback(JNIEnv *env, jobject frame_callback_obj, int pixel_format);
 	int startPreview();

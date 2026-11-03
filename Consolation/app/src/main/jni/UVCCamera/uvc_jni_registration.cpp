@@ -38,6 +38,8 @@
 #include <errno.h>
 #include <sys/ioctl.h>
 
+#include <vector>
+
 #include "libUVCCamera.h"
 #include "UVCCamera.h"
 
@@ -307,6 +309,39 @@ static jint nativeSetPreviewTransform(JNIEnv *env, jobject thiz,
 		return camera->setPreviewTransform(rotation, flip_h == JNI_TRUE, flip_v == JNI_TRUE,
 			scale, pan_x, pan_y, fit_x, fit_y);
 	return JNI_ERR;
+}
+
+/* 3D LUT: size^3 RGBA texels, red varying fastest.  Each Java int carries one
+ * texel as r | (g << 8) | (b << 16) | (a << 24); alpha is ignored by the LUT.
+ * size 0 disables the LUT.  Returns 0 on success, -1 on a bad argument. */
+static jint nativeSetPreviewLut(JNIEnv *env, jobject thiz,
+	ID_TYPE id_camera, jint size, jintArray rgba, jfloat strength) {
+	static const jint MAX_LUT_SIZE = 64;
+	UVCCamera *camera = reinterpret_cast<UVCCamera *>(id_camera);
+	if (UNLIKELY(!camera))
+		return JNI_ERR;
+	if (size < 0 || size > MAX_LUT_SIZE || (size > 0 && size < 2))
+		return JNI_ERR;
+	if (size == 0)
+		return (camera->setPreviewLut(NULL, 0, strength) == 0) ? 0 : -1;
+	if (!rgba)
+		return JNI_ERR;
+	const jsize texels = size * size * size;
+	if (env->GetArrayLength(rgba) < texels)
+		return JNI_ERR;
+	jint *els = env->GetIntArrayElements(rgba, NULL);
+	if (!els)
+		return JNI_ERR;
+	std::vector<uint8_t> lut((size_t)texels * 4u);
+	for (jsize i = 0; i < texels; ++i) {
+		const uint32_t v = (uint32_t)els[i];
+		lut[i * 4 + 0] = (uint8_t)(v & 0xff);
+		lut[i * 4 + 1] = (uint8_t)((v >> 8) & 0xff);
+		lut[i * 4 + 2] = (uint8_t)((v >> 16) & 0xff);
+		lut[i * 4 + 3] = (uint8_t)((v >> 24) & 0xff);
+	}
+	env->ReleaseIntArrayElements(rgba, els, JNI_ABORT);
+	return (camera->setPreviewLut(lut.data(), size, strength) == 0) ? 0 : -1;
 }
 
 static jint nativeSetFrameCallback(JNIEnv *env, jobject thiz,
@@ -2109,6 +2144,7 @@ static JNINativeMethod methods[] = {
 	{ "nativeStopPreview",				"(J)I", (void *) nativeStopPreview },
 	{ "nativeSetPreviewDisplay",		"(JLandroid/view/Surface;)I", (void *) nativeSetPreviewDisplay },
 	{ "nativeSetPreviewTransform",		"(JIZZFFFFF)I", (void *) nativeSetPreviewTransform },
+	{ "nativeSetPreviewLut",			"(JI[IF)I", (void *) nativeSetPreviewLut },
 	{ "nativeSetPreviewFrameCallback",	"(JLorg/centennialoss/consolation/uvc/IFrameCallback;I)I", (void *) nativeSetPreviewFrameCallback },
 	{ "nativeSetFrameCallback",			"(JLorg/centennialoss/consolation/uvc/IFrameCallback;I)I", (void *) nativeSetFrameCallback },
 
